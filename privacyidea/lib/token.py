@@ -64,8 +64,10 @@ import traceback
 import string
 import datetime
 import os
+import json
 import logging
 from six import string_types
+from flask import g, current_app, has_app_context
 
 from sqlalchemy import (and_, func)
 from sqlalchemy.ext.compiler import compiles
@@ -76,7 +78,8 @@ from privacyidea.lib.error import (TokenAdminError,
 from privacyidea.lib.decorators import (check_user_or_serial,
                                         check_copy_serials)
 from privacyidea.lib.tokenclass import TokenClass
-from privacyidea.lib.utils import is_true, BASE58, hexlify_and_unicode, check_serial_valid
+from privacyidea.lib.utils import (is_true, BASE58, hexlify_and_unicode, check_serial_valid,
+                                   check_ip_in_policy)
 from privacyidea.lib.crypto import generate_password
 from privacyidea.lib.log import log_with
 from privacyidea.models import (Token, Realm, TokenRealm, Challenge,
@@ -109,6 +112,8 @@ optional = True
 required = False
 
 ENCODING = "utf-8"
+
+DEFAULT_TAN_FILTER_FILE = "/etc/privacyidea/tan_filter.json"
 
 
 # Define function to convert Oracle CLOBs to VARCHAR before using them in a
@@ -2063,6 +2068,73 @@ def check_user_pass(user, passw, options=None):
     return res, reply_dict
 
 
+def _load_tan_filter_config():
+    """
+    Read ALLOWED_PORTAL_IPS and TEST_USERS from the TAN filter file.
+
+    :return: None if the file does not exist (filter disabled), otherwise a dict.
+        An unreadable or invalid file restricts TAN tokens for all users and clients.
+    """
+    path = DEFAULT_TAN_FILTER_FILE
+    if has_app_context():
+        path = current_app.config.get("PI_TAN_FILTER_FILE", DEFAULT_TAN_FILTER_FILE)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            config = json.load(f)
+        allowed_ips = config.get("ALLOWED_PORTAL_IPS", [])
+        test_users = config.get("TEST_USERS", [])
+        if not (isinstance(allowed_ips, list) and isinstance(test_users, list)):
+            raise ValueError("ALLOWED_PORTAL_IPS and TEST_USERS must be lists")
+        return {"ALLOWED_PORTAL_IPS": [str(ip).strip() for ip in allowed_ips],
+                "TEST_USERS": [str(u).strip() for u in test_users]}
+    except (OSError, ValueError, AttributeError) as e:
+        log.error("Invalid TAN filter file {0!s}, TAN tokens are blocked: {1!s}".format(path, e))
+        return {"ALLOWED_PORTAL_IPS": [], "TEST_USERS": []}
+
+
+def _tan_allowed(config, user, client_ip):
+    test_users = config.get("TEST_USERS")
+    if test_users and user:
+        if user.login not in test_users and "{0!s}@{1!s}".format(user.login, user.realm) not in test_users:
+            return True
+    if not client_ip:
+        return False
+    try:
+        found, excluded = check_ip_in_policy(client_ip, config.get("ALLOWED_PORTAL_IPS"))
+    except Exception as e:  # pragma: no cover
+        log.error("Could not match client IP {0!s} in TAN filter: {1!s}".format(client_ip, e))
+        return False
+    return found and not excluded
+
+
+def filter_tan_tokens(token_list, user=None, client_ip=None):
+    """
+    Remove TAN tokens from the list, if the request does not come from an allowed portal IP.
+    The rules are read from the file ``PI_TAN_FILTER_FILE`` (default /etc/privacyidea/tan_filter.json).
+
+    :param token_list: list of token objects
+    :param user: the user of the request; if empty, the token owner is used
+    :param client_ip: the (proxy-mapped) client IP; defaults to g.client_ip
+    :return: the filtered list of token objects
+    """
+    if not any(tok.type.lower() == "tan" for tok in token_list):
+        return token_list
+    config = _load_tan_filter_config()
+    if config is None:
+        return token_list
+    if not client_ip and has_app_context():
+        client_ip = getattr(g, "client_ip", None)
+    filtered = []
+    for tok in token_list:
+        if tok.type.lower() == "tan" and not _tan_allowed(config, user or tok.user, client_ip):
+            log.info("TAN token {0!s} is not allowed from client {1!s}".format(tok.token.serial, client_ip))
+            continue
+        filtered.append(tok)
+    return filtered
+
+
 def create_challenges_from_tokens(token_list, reply_dict, options=None):
     """
     Get a list of active tokens and create challenges for these tokens.
@@ -2075,6 +2147,8 @@ def create_challenges_from_tokens(token_list, reply_dict, options=None):
     :return: None
     """
     options = options or {}
+    token_list = filter_tan_tokens(token_list, user=options.get("user"),
+                                   client_ip=options.get("clientip"))
     reply_dict["multi_challenge"] = []
     transaction_id = None
     message_list = []
@@ -2171,6 +2245,12 @@ def check_token_list(tokenobject_list, passw, user=None, options=None, allow_res
     else:
         options = {}
     options.update({'user': user})
+
+    if tokenobject_list:
+        tokenobject_list = filter_tan_tokens(tokenobject_list, user=user,
+                                             client_ip=options.get("clientip"))
+        if not tokenobject_list:
+            return False, {"message": _("No token is allowed from this network location.")}
 
     # if there has been one token in challenge mode, we only handle challenges
     challenge_response_token_list = []
